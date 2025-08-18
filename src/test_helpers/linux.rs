@@ -404,6 +404,8 @@ impl<'a> TestServiceBuilder<'a> {
                 endpoints: Default::default(), // populated later when workloads are added
                 subject_alt_names: vec![],
                 waypoint: None,
+                waypoints: Default::default(),
+                clusters: Default::default(),
                 load_balancer: None,
                 ip_families: None,
             },

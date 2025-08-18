@@ -101,6 +101,7 @@ impl Inbound {
                     }
                 };
                 let src = to_canonical(src);
+                info!("new connection from {:?}", src);
                 let start = Instant::now();
                 let drain = drain.clone();
                 let force_shutdown = force_shutdown.clone();
@@ -962,6 +963,8 @@ mod tests {
             waypoint: waypoint.service_attached(),
             load_balancer: None,
             ip_families: None,
+            waypoints: Default::default(),
+            clusters: Default::default(),
         });
 
         let workloads = vec![

@@ -195,6 +195,8 @@ pub fn mock_default_service() -> Service {
         waypoint: None,
         load_balancer: None,
         ip_families: None,
+        waypoints: Default::default(),
+        clusters: Default::default(),
     }
 }
 
@@ -289,6 +291,8 @@ fn test_custom_svc(
         waypoint: None,
         load_balancer: None,
         ip_families: None,
+        waypoints: Default::default(),
+        clusters: Default::default(),
     })
 }
 

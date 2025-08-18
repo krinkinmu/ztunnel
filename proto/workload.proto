@@ -79,6 +79,34 @@ message Service {
   // through the waypoint.
   GatewayAddress waypoint = 7;
 
+  // Waypoint proxies for each cluster that can serve request for this service.
+  // In multi-cluster scenario where each cluster is configured independently we may end up with different waypoints
+  // in different clusters for the same service or even have waypoints configured only in some clusters but not all of
+  // them.
+  //
+  // To handle such non-uniform cases we add a mapping from cluster ID to a waypoint address that should be used when
+  // contacting the service in that cluster.
+  //
+  // In multi-cluster scenario, ztunnel makes load balancing decision in two steps (at least logically):
+  //
+  //  1. It picks the cluster first
+  //     - for now, ztunnel assumes that all clusters have equal weight
+  //     - ztunnel respects the load balancing policy of the local cluster, specifically, it will prefer staying in
+  //       the same cluster and/or network when thouse routing preferences are set
+  //  2. Once it picked a cluster, it will pick a backend in that cluster where the request will be routed.
+  //
+  // If we picked a cluster where a service has a configured waypoint, we will pick a backend of the waypoint,
+  // otherwise we will pick one of the available service backends.
+  //
+  // NOTE: that it could happen that once we picked a cluster we can't actually find any healthy backends in that
+  // cluster to chose from, in this case we will fall back to other clusters. If load balancing mode is FAILOVER we
+  // will even consider clusters that don't match the scope.
+  map<string, GatewayAddress> waypoints = 11;
+
+  // All clusters that serve requests for this service.
+  // This provides a list of all clusters that ztunnel can pick from when deciding where to route the request.
+  repeated Cluster clusters = 12;
+
   // Load balancing policy for selecting endpoints.
   // Note: this applies only to connecting directly to the workload; when waypoints are used, the waypoint's load_balancing
   // configuration is used.
@@ -379,4 +407,24 @@ message Extension {
   string name = 1;
   // config provides some opaque configuration.
   google.protobuf.Any config = 2;
+}
+
+// Cluster provides details needed to pick the destination cluster when doing load balancing in ztunnel.
+// In multi-cluster scenario ztunnel makes load balancing decision in two steps:
+//   1. Pick the destination cluster first
+//   2. Pick a backend for the service in the destination cluster
+// This message gives ztunnel the information needed to make the first step and pick the cluster where
+// the request will be routed.
+//
+// We initially assume that all clusters are equal weight, but once we have the metadata in place we can
+// actually provide knobs that would allow to change the weight of the cluster manually or derive it
+// automatically (i.e., by measuring latency and assigning higher weight to clusters with lower latency).
+message Cluster {
+  // What network does this cluster belong to.
+  string network = 1;
+  // Cluster name.
+  string cluster = 2;
+  // Weight of this cluster for load balancing purposes.
+  // Clusters with higher weight will be more likely to be picked than clusters with lower weight.
+  uint32 weight = 3;
 }

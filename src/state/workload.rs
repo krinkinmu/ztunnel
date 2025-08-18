@@ -1124,6 +1124,8 @@ mod tests {
                     load_balancing: None,
                     ip_families: 0,
                     extensions: Default::default(),
+                    waypoints: Default::default(),
+                    clusters: Default::default(),
                 },
             )
             .unwrap();
@@ -1158,6 +1160,8 @@ mod tests {
                     load_balancing: None,
                     ip_families: 0,
                     extensions: Default::default(),
+                    waypoints: Default::default(),
+                    clusters: Default::default(),
                 },
             )
             .unwrap();
@@ -1215,6 +1219,8 @@ mod tests {
                     load_balancing: None,
                     ip_families: 0,
                     extensions: Default::default(),
+                    waypoints: Default::default(),
+                    clusters: Default::default(),
                 },
             )
             .unwrap();
@@ -1526,6 +1532,8 @@ mod tests {
                     load_balancing: None,
                     ip_families: 0,
                     extensions: Default::default(),
+                    waypoints: Default::default(),
+                    clusters: Default::default(),
                 },
             )
             .unwrap();
@@ -1553,6 +1561,8 @@ mod tests {
                     }),
                     ip_families: 0,
                     extensions: Default::default(),
+                    waypoints: Default::default(),
+                    clusters: Default::default(),
                 },
             )
             .unwrap();
@@ -1604,6 +1614,8 @@ mod tests {
             }),
             ip_families: 0,
             extensions: Default::default(),
+            waypoints: Default::default(),
+            clusters: Default::default(),
         };
         updater
             .insert_service(
@@ -1625,6 +1637,8 @@ mod tests {
                     load_balancing: None,
                     ip_families: 0,
                     extensions: Default::default(),
+                    waypoints: Default::default(),
+                    clusters: Default::default(),
                 },
             )
             .unwrap();

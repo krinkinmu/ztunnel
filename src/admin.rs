@@ -693,6 +693,8 @@ mod tests {
             }), // ..Default::default() // intentionally don't default. we want all fields populated
             ip_families: 0,
             extensions: Default::default(),
+            waypoints: Default::default(),
+            clusters: Default::default(),
         };
 
         let auth = XdsAuthorization {

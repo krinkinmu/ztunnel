@@ -48,7 +48,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::time::Duration;
-use tracing::{debug, trace, warn};
+use tracing::{info, debug, trace, warn};
 
 use self::workload::ApplicationTunnel;
 
@@ -363,7 +363,7 @@ impl ProxyState {
 
         let endpoints = svc.endpoints.iter().filter_map(|ep| {
             let Some(wl) = self.workloads.find_uid(&ep.workload_uid) else {
-                debug!("failed to fetch workload for {}", ep.workload_uid);
+                info!("failed to fetch workload for {}", ep.workload_uid);
                 return None;
             };
 
@@ -379,11 +379,12 @@ impl ProxyState {
                 }
             }
 
+            info!("considering endpoint {}", ep.workload_uid);
             match resolution_mode {
                 ServiceResolutionMode::Standard => {
                     if target_port.unwrap_or_default() == 0 && !ep.port.contains_key(&svc_port) {
                         // Filter workload out, it doesn't have a matching port
-                        trace!(
+                        info!(
                             "filter endpoint {}, it does not have service port {}",
                             ep.workload_uid, svc_port
                         );
@@ -396,7 +397,7 @@ impl ProxyState {
                         // This is only valid for waypoints, which are not explicitly addressed by users.
                         // We do happen to do a lookup by `waypoint-svc:15008`, this is not a literal call on that service;
                         // the port is not required at all if they have application tunnel, as it will be handled by ztunnel on the other end.
-                        trace!(
+                        info!(
                             "filter waypoint endpoint {}, target port is not defined",
                             ep.workload_uid
                         );
@@ -440,8 +441,10 @@ impl ProxyState {
                         if lb.mode == LoadBalancerMode::Strict
                             && rank != lb.routing_preferences.len()
                         {
+                            info!("drop endpoint {} from consideration because it does not match load balancing policy", ep.workload_uid);
                             return None;
                         }
+                        info!("consider endpoint {} with weight {}", ep.workload_uid, wl.capacity);
                         Some((rank, ep, wl))
                     })
                     .collect::<Vec<_>>();

@@ -20,6 +20,8 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use tracing::trace;
 
+use xds::istio::workload::Cluster as XdsCluster;
+use xds::istio::workload::GatewayAddress as XdsGatewayAddress;
 use xds::istio::workload::Service as XdsService;
 
 use crate::state::workload::{
@@ -46,6 +48,13 @@ pub struct Service {
     pub endpoints: EndpointSet,
     #[serde(default)]
     pub subject_alt_names: Vec<Strng>,
+
+    /// Maps cluster to a waypoint that should be used for the service in that cluster, if any
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub waypoints: WaypointSet,
+
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub clusters: Vec<Cluster>,
 
     #[serde(default, skip_serializing_if = "is_default")]
     pub waypoint: Option<GatewayAddress>,
@@ -271,6 +280,62 @@ pub struct Endpoint {
     pub status: HealthStatus,
 }
 
+#[derive(Debug, Eq, PartialEq, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Cluster {
+    pub cluster: Strng,
+    pub network: Strng,
+}
+
+impl TryFrom<&XdsCluster> for Cluster {
+    type Error =  WorkloadError;
+
+    fn try_from(c: &XdsCluster) -> Result<Self, Self::Error> {
+        Ok(Cluster {
+            cluster: strng::new(&c.cluster),
+            network: strng::new(&c.network),
+        })
+    }
+}
+
+#[derive(Default, Debug, Eq, PartialEq, Clone)]
+pub struct WaypointSet {
+    pub inner: HashMap<Strng, GatewayAddress>,
+}
+
+impl TryFrom<&HashMap<String, XdsGatewayAddress>> for WaypointSet {
+    type Error = WorkloadError;
+
+    fn try_from(m: &HashMap<String, XdsGatewayAddress>) -> Result<Self, Self::Error> {
+        Ok(WaypointSet {
+            inner: m.iter().map(|e| {
+                let waypoint = GatewayAddress::try_from(e.1)?;
+                let cluster = strng::new(e.0);
+                Ok((cluster, waypoint))
+            }).collect::<Result<HashMap<Strng, GatewayAddress>, Self::Error>>()?,
+        })
+    }
+}
+
+impl serde::Serialize for WaypointSet {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.inner.serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for WaypointSet {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        <HashMap<Strng, GatewayAddress>>::deserialize(deserializer)
+            .map(|inner| WaypointSet { inner })
+    }
+}
+
 impl TryFrom<&XdsService> for Service {
     type Error = WorkloadError;
 
@@ -308,6 +373,9 @@ impl TryFrom<&XdsService> for Service {
             None
         };
         let ip_families = xds::istio::workload::IpFamilies::try_from(s.ip_families)?.into();
+        let waypoints = WaypointSet::try_from(&s.waypoints)?;
+        let clusters: Vec<Cluster> = s.clusters.iter().map(|c| Cluster::try_from(c)).collect::<Result<Vec<_>, Self::Error>>()?;
+
         let svc = Service {
             name: Strng::from(&s.name),
             namespace: Strng::from(&s.namespace),
@@ -317,6 +385,8 @@ impl TryFrom<&XdsService> for Service {
                 ports: s.ports.clone(),
             })
                 .into(),
+            waypoints: waypoints,
+            clusters: clusters,
             endpoints: Default::default(), // Will be populated once inserted into the store.
             subject_alt_names: s.subject_alt_names.iter().map(strng::new).collect(),
             waypoint,
