@@ -18,6 +18,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, atomic};
 use std::time::Instant;
 
+use tracing::debug;
+
 use prometheus_client::encoding::{
     EncodeLabelSet, EncodeLabelValue, LabelSetEncoder, LabelValueEncoder,
 };
@@ -187,7 +189,7 @@ impl CommonTrafficLabels {
 
 impl From<ConnectionOpen> for CommonTrafficLabels {
     fn from(c: ConnectionOpen) -> Self {
-        CommonTrafficLabels {
+        let tl = CommonTrafficLabels {
             reporter: c.reporter,
             request_protocol: RequestProtocol::tcp,
             response_flags: ResponseFlags::None,
@@ -198,7 +200,9 @@ impl From<ConnectionOpen> for CommonTrafficLabels {
                 .with_source(c.source.as_deref())
                 .with_destination(c.destination.as_deref())
                 .with_destination_service(c.destination_service.as_ref())
-        }
+        };
+        debug!("created traffic lables: {:?}", tl);
+        tl
     }
 }
 

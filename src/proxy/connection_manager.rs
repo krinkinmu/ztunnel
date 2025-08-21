@@ -583,6 +583,7 @@ mod tests {
             ResolverConfig::default(),
             ResolverOpts::default(),
             metrics,
+            15008,
         );
         let connection_manager = ConnectionManager::default();
         let (tx, stop) = drain::new();

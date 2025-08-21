@@ -1006,6 +1006,7 @@ mod tests {
             ResolverConfig::default(),
             ResolverOpts::default(),
             metrics,
+            15008,
         ))
     }
 

@@ -380,6 +380,7 @@ pub fn rbac(c: &mut Criterion) {
         ResolverConfig::default(),
         ResolverOpts::default(),
         metrics,
+        15008,
     );
     let rc = ProxyRbacContext {
         conn: rbac::Connection {

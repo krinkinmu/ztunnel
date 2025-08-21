@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(test)]
+use tracing_test::traced_test;
+
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
@@ -36,8 +39,8 @@ use crate::drain::DrainWatcher;
 use crate::drain::run_with_drain;
 use crate::proxy::h2::{H2Stream, client::WorkloadKey};
 use crate::state::service::{Service, ServiceDescription};
-use crate::state::workload::OutboundProtocol;
-use crate::state::workload::{InboundProtocol, NetworkAddress, Workload, address::Address};
+use crate::state::workload::{InboundProtocol, OutboundProtocol};
+use crate::state::workload::{NetworkAddress, Workload, address::Address};
 use crate::state::{ServiceResolutionMode, Upstream};
 use crate::{assertions, copy, proxy, socket};
 
@@ -90,6 +93,7 @@ impl Outbound {
                 let mut force_shutdown = force_shutdown.clone();
                 match socket {
                     Ok((stream, _remote)) => {
+                        assert!(self.pi.cfg.inbound_addr.port() != 0);
                         let mut oc = OutboundConnection {
                             pi: self.pi.clone(),
                             id: TraceParent::new(),
@@ -348,6 +352,7 @@ impl OutboundConnection {
     }
 
     fn conn_metrics_from_request(req: &Request) -> ConnectionOpen {
+        debug!("Req {:?}", req);
         let (derived_source, security_policy) = match req.protocol {
             OutboundProtocol::HBONE | OutboundProtocol::DOUBLEHBONE => (
                 Some(DerivedWorkload {
@@ -465,6 +470,44 @@ impl OutboundConnection {
             })
             .await
         {
+            debug!("{:?} is a servicem checking if it has a waypoint", target_service);
+            if !target_service.waypoints.inner.is_empty() {
+                // This is the new logic that triggers when the target is a service and we have a
+                // non-uniform waypoint setup
+                if let Some(upstream) = state
+                    .fetch_service_upstream(target_service.clone(), &source_workload, target)
+                    .await?
+                {
+                    if upstream.workload.network != source_workload.network {
+                        info!("picked a destination on a different network");
+                        return self
+                            .build_request_through_gateway(
+                                source_workload.clone(),
+                                upstream,
+                                &target_service,
+                                target,
+                            ).await;
+                    }
+                    let actual_destination = upstream.workload_socket_addr()
+                        .ok_or(Error::NoValidDestination(Box::new((*upstream.workload).clone())))?;
+                    let hbone_target_destination = upstream.hbone_target_destination()?;
+
+                    // For case no waypoint for both side and direct to remote node proxy
+                    let (upstream_sans, final_sans) = (upstream.workload_and_services_san(), vec![]);
+                    return Ok(Request {
+                        protocol: OutboundProtocol::HBONE,
+                        source: source_workload,
+                        hbone_target_destination,
+                        actual_destination_workload: Some(upstream.workload.clone()),
+                        intended_destination_service: Some(ServiceDescription::from(&*target_service)),
+                        actual_destination,
+                        upstream_sans,
+                        final_sans,
+                    });
+                }
+                return Err(Error::NoHealthyUpstream(target));
+            }
+
             // if we have a waypoint for this svc, use it; otherwise route traffic normally
             if let Some(waypoint) = state
                 .fetch_service_waypoint(&target_service, &source_workload, target)
@@ -489,11 +532,12 @@ impl OutboundConnection {
                         .ok_or(Error::NoValidDestination(Box::new(
                             (*waypoint.workload).clone(),
                         )))?;
+                let hbone_target_destination = waypoint.hbone_target_destination()?;
                 debug!("built request to service waypoint proxy");
                 return Ok(Request {
                     protocol: OutboundProtocol::HBONE,
                     source: source_workload,
-                    hbone_target_destination: Some(HboneAddress::SocketAddr(target)),
+                    hbone_target_destination,
                     actual_destination_workload: Some(waypoint.workload),
                     intended_destination_service: Some(ServiceDescription::from(&*target_service)),
                     actual_destination,
@@ -582,13 +626,14 @@ impl OutboundConnection {
                             (*waypoint.workload).clone(),
                         )))?;
                 let upstream_sans = waypoint.workload_and_services_san();
+                let hbone_target_destination = waypoint.hbone_target_destination()?;
                 debug!("built request to workload waypoint proxy");
                 return Ok(Request {
                     // Always use HBONE here
                     protocol: OutboundProtocol::HBONE,
                     source: source_workload,
                     // Use the original VIP, not translated
-                    hbone_target_destination: Some(HboneAddress::SocketAddr(target)),
+                    hbone_target_destination,
                     actual_destination_workload: Some(waypoint.workload),
                     intended_destination_service: us.destination_service.clone(),
                     actual_destination,
@@ -599,24 +644,13 @@ impl OutboundConnection {
             // Workload doesn't have a waypoint; send directly
         }
 
-        let selected_workload_ip = us
-            .selected_workload_ip
+        let actual_destination = us.workload_socket_addr()
             .ok_or(Error::NoValidDestination(Box::new((*us.workload).clone())))?;
+        let hbone_target_destination = us.hbone_target_destination()?;
 
-        // only change the port if we're sending HBONE
-        let actual_destination = match us.workload.protocol {
-            InboundProtocol::HBONE => SocketAddr::from((selected_workload_ip, self.hbone_port)),
-            InboundProtocol::TCP => us
-                .workload_socket_addr()
-                .ok_or(Error::NoValidDestination(Box::new((*us.workload).clone())))?,
-        };
-        let hbone_target_destination = match us.workload.protocol {
-            InboundProtocol::HBONE => Some(HboneAddress::SocketAddr(
-                us.workload_socket_addr()
-                    .ok_or(Error::NoValidDestination(Box::new((*us.workload).clone())))?,
-            )),
-            InboundProtocol::TCP => None,
-        };
+        if us.workload.protocol == InboundProtocol::HBONE {
+            assert_eq!(actual_destination.port(), self.hbone_port);
+        }
 
         // For case no waypoint for both side and direct to remote node proxy
         let (upstream_sans, final_sans) = (us.workload_and_services_san(), vec![]);
@@ -1238,6 +1272,215 @@ mod tests {
             }),
         )
         .await;
+    }
+
+    #[tokio::test]
+    //#[traced_test]
+    async fn build_request_heterogenious_multicluster() {
+        let waypoint_service = XdsAddressType::Service(XdsService {
+            name: "waypoint.com".into(),
+            hostname: "waypoint.com".into(),
+            addresses: vec![XdsNetworkAddress {
+                network: "".into(),
+                address: vec![127, 0, 0, 4],
+            }],
+            ports: vec![Port {
+                service_port: 15008,
+                target_port: 15008,
+            }],
+            ..Default::default()
+        });
+
+        let healthy_local_waypoint_workload = XdsAddressType::Workload(XdsWorkload {
+            uid: "Kubernetes//Pod/default/local-waypoint.com-pod".into(),
+            addresses: vec![Bytes::copy_from_slice(&[127, 0, 0, 2])],
+            cluster_id: "local".into(),
+            network: "".into(),
+            tunnel_protocol: xds::istio::workload::TunnelProtocol::Hbone.into(),
+            services: std::collections::HashMap::from([(
+                "/waypoint.com".into(),
+                PortList {
+                    ports: vec![Port {
+                        service_port: 15008,
+                        target_port: 15008,
+                    }],
+                },
+            )]),
+            status: xds::istio::workload::WorkloadStatus::Healthy.into(),
+            ..Default::default()
+        });
+        let unhealthy_local_waypoint_workload = XdsAddressType::Workload(XdsWorkload {
+            uid: "Kubernetes//Pod/default/local-waypoint.com-pod".into(),
+            addresses: vec![Bytes::copy_from_slice(&[127, 0, 0, 2])],
+            cluster_id: "local".into(),
+            network: "".into(),
+            tunnel_protocol: xds::istio::workload::TunnelProtocol::Hbone.into(),
+            services: std::collections::HashMap::from([(
+                "/waypoint.com".into(),
+                PortList {
+                    ports: vec![Port {
+                        service_port: 15008,
+                        target_port: 15008,
+                    }],
+                },
+            )]),
+            status: xds::istio::workload::WorkloadStatus::Unhealthy.into(),
+            ..Default::default()
+        });
+
+        let waypoint_gw = xds::istio::workload::GatewayAddress {
+            destination: Some(
+                xds::istio::workload::gateway_address::Destination::Hostname(
+                    XdsNamespacedHostname {
+                        namespace: Default::default(),
+                        hostname: "waypoint.com".into(),
+                    },
+                ),
+            ),
+            hbone_mtls_port: 15008,
+        };
+
+        // Old version of how we represent waypoint information in the service where we have just
+        // one field for the service.
+        let service_with_waypoint = XdsAddressType::Service(XdsService {
+            name: "example.com".into(),
+            hostname: "example.com".into(),
+            addresses: vec![XdsNetworkAddress {
+                network: "".into(),
+                address: vec![127, 0, 0, 3],
+            }],
+            ports: vec![Port {
+                service_port: 80,
+                target_port: 8080,
+            }],
+            waypoint: Some(waypoint_gw.clone()),
+            ..Default::default()
+        });
+        // New way of representing waypoint information, where we have a map that maps cluster id
+        // to waypoint address, so we can have different setup in different clusters.
+        let service_with_waypoints = XdsAddressType::Service(XdsService {
+            name: "example.com".into(),
+            hostname: "example.com".into(),
+            addresses: vec![XdsNetworkAddress {
+                network: "".into(),
+                address: vec![127, 0, 0, 3],
+            }],
+            ports: vec![Port {
+                service_port: 80,
+                target_port: 8080,
+            }],
+            waypoints: std::collections::HashMap::from([("local".into(), waypoint_gw.clone())]),
+            ..Default::default()
+        });
+
+        let healthy_remote_service_workload = XdsAddressType::Workload(XdsWorkload {
+            uid: "Kubernetes//Pod/default/remote-example.com-pod".into(),
+            addresses: vec![Bytes::copy_from_slice(&[127, 0, 0, 5])],
+            cluster_id: "remote".into(),
+            network: "".into(),
+            tunnel_protocol: xds::istio::workload::TunnelProtocol::Hbone.into(),
+            services: std::collections::HashMap::from([(
+                "/example.com".into(),
+                PortList {
+                    ports: vec![Port {
+                        service_port: 80,
+                        target_port: 8080,
+                    }],
+                },
+            )]),
+            status: xds::istio::workload::WorkloadStatus::Healthy.into(),
+            ..Default::default()
+        });
+        let unhealthy_remote_service_workload = XdsAddressType::Workload(XdsWorkload {
+            uid: "Kubernetes//Pod/default/remote-example.com-pod".into(),
+            addresses: vec![Bytes::copy_from_slice(&[127, 0, 0, 5])],
+            cluster_id: "remote".into(),
+            network: "".into(),
+            tunnel_protocol: xds::istio::workload::TunnelProtocol::Hbone.into(),
+            services: std::collections::HashMap::from([(
+                "/example.com".into(),
+                PortList {
+                    ports: vec![Port {
+                        service_port: 80,
+                        target_port: 8080,
+                    }],
+                },
+            )]),
+            status: xds::istio::workload::WorkloadStatus::Unhealthy.into(),
+            ..Default::default()
+        });
+        // When we have only a single cluster to chose from, it should not matter how waypoints are
+        // specified (using waypoint field or using waypoints field), the end result should be the
+        // same.
+        //
+        // In this particular case, the only way to contact the service is through the waypoint, so
+        // we should build a typical request through waypoint.
+        run_build_request_multi(
+            "127.0.0.1",
+            "127.0.0.3:80",
+            vec![
+                waypoint_service.clone(),
+                healthy_local_waypoint_workload.clone(),
+                service_with_waypoint.clone(),
+            ],
+            Some(ExpectedRequest {
+                protocol: OutboundProtocol::HBONE,
+                hbone_destination: "127.0.0.3:80",
+                destination: "127.0.0.2:15008",
+            }),
+        ).await;
+        run_build_request_multi(
+            "127.0.0.1",
+            "127.0.0.3:80",
+            vec![
+                waypoint_service.clone(),
+                healthy_local_waypoint_workload.clone(),
+                service_with_waypoints.clone(),
+            ],
+            Some(ExpectedRequest {
+                protocol: OutboundProtocol::HBONE,
+                hbone_destination: "127.0.0.3:80",
+                destination: "127.0.0.2:15008",
+            }),
+        ).await;
+
+        // Now we can check actually heterogenious setup where we have waypoint in one cluster and
+        // no waypoint in another cluster.
+        run_build_request_multi(
+            "127.0.0.1",
+            "127.0.0.3:80",
+            vec![
+                waypoint_service.clone(),
+                healthy_local_waypoint_workload.clone(),
+                unhealthy_remote_service_workload.clone(),
+                service_with_waypoints.clone(),
+            ],
+            // Between a healthy local waypoint and an unhealthy service backend in a remote
+            // cluster without waypoint we should chose the healthy local waypoint
+            Some(ExpectedRequest {
+                protocol: OutboundProtocol::HBONE,
+                hbone_destination: "127.0.0.3:80",
+                destination: "127.0.0.2:15008",
+            }),
+        ).await;
+        run_build_request_multi(
+            "127.0.0.1",
+            "127.0.0.3:80",
+            vec![
+                waypoint_service.clone(),
+                unhealthy_local_waypoint_workload.clone(),
+                healthy_remote_service_workload.clone(),
+                service_with_waypoints.clone(),
+            ],
+            // Now the opposite, local waypoint is unhealthy, but the service has a healthy backend
+            // in a remote cluster without waypoint - in this case we should pick a backend on a
+            // remote cluster without endpoint
+            Some(ExpectedRequest {
+                protocol: OutboundProtocol::HBONE,
+                hbone_destination: "127.0.0.5:8080",
+                destination: "127.0.0.5:15008",
+            }),
+        ).await;
     }
 
     #[tokio::test]

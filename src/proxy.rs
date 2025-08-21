@@ -306,6 +306,7 @@ impl Proxy {
             old_cfg.inbound_addr = inbound.address();
             let mut new_pi = (*pi).clone();
             new_pi.cfg = Arc::new(old_cfg);
+            new_pi.state.set_hbone_port(inbound.address().port());
             pi = Arc::new(new_pi);
             warn!("TEST FAKE: new address is {:?}", pi.cfg.inbound_addr);
         }

@@ -117,6 +117,8 @@ impl AdsServer {
             ResolverConfig::default(),
             ResolverOpts::default(),
             proxy_metrics,
+            // Note, we can't use cfg.inbound_addr.port() here as all ports are set to 0
+            15008,
         );
         let store_updater = ProxyStateUpdater::new_no_fetch(state);
         let tls_client_fetcher = Box::new(tls::ControlPlaneAuthentication::RootCert(

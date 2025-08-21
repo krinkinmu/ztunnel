@@ -1824,6 +1824,7 @@ mod tests {
             ResolverConfig::default(),
             ResolverOpts::default(),
             metrics,
+            15008,
         );
         let updater = ProxyStateUpdateMutator::new_no_fetch();
         (state, demand, updater)

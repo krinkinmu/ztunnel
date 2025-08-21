@@ -81,6 +81,7 @@ impl Default for Fixture {
             ResolverConfig::default(),
             ResolverOpts::default(),
             metrics.clone(),
+            cfg.inbound_addr.port(),
         );
 
         let ipc = InPodConfig::new(&cfg).unwrap();

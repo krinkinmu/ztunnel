@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::identity::{Identity, SecretManager};
-use crate::proxy::{Error, OnDemandDnsLabels};
+use crate::proxy::{Error, HboneAddress, OnDemandDnsLabels};
 use crate::rbac::Authorization;
 use crate::state::policy::PolicyStore;
 use crate::state::service::{
@@ -21,7 +21,7 @@ use crate::state::service::{
 };
 use crate::state::service::{Service, ServiceDescription};
 use crate::state::workload::{
-    GatewayAddress, NamespacedHostname, NetworkAddress, Workload, WorkloadStore, address::Address,
+    GatewayAddress, InboundProtocol, NamespacedHostname, NetworkAddress, Workload, WorkloadStore, address::Address,
     gatewayaddress::Destination, network_addr,
 };
 use crate::strng::Strng;
@@ -40,7 +40,7 @@ use itertools::Itertools;
 use rand::prelude::IteratorRandom;
 use rand::seq::IndexedRandom;
 use serde::Serializer;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Into;
 use std::default::Default;
 use std::fmt;
@@ -71,13 +71,28 @@ pub struct Upstream {
     pub service_sans: Vec<Strng>,
     /// If this was from a service, the service info.
     pub destination_service: Option<ServiceDescription>,
+    /// Original target VIP we tried to resolve. When we resolve waypoints, this should be VIP of
+    /// the original target service or workload and not waypoint address
+    pub original_target: SocketAddr,
+    /// When connection is routed through a waypoint this will be true, false otherwise.
+    pub through_waypoint: bool,
+    /// Port we connect to when we talk to a ztunnel on the other side (e.g., no waypoint and using
+    /// HBONE protocol).
+    pub hbone_port: u16,
 }
 
 impl Upstream {
     pub fn workload_socket_addr(&self) -> Option<SocketAddr> {
-        self.selected_workload_ip
-            .map(|ip| SocketAddr::new(ip, self.port))
+        // When we talk to another ztunnel directly (e.g., no waypoint) instead of connecting to
+        // the target port we need to connect to the HBONE port where ztunnel listens.
+        let port = if self.workload.protocol == InboundProtocol::HBONE && !self.through_waypoint {
+            self.hbone_port
+        } else {
+            self.port
+        };
+        self.selected_workload_ip.map(|ip| SocketAddr::new(ip, port))
     }
+
     pub fn workload_and_services_san(&self) -> Vec<Identity> {
         self.service_sans
             .iter()
@@ -103,6 +118,35 @@ impl Upstream {
                 }
             })
             .collect()
+    }
+
+    pub fn hbone_target_destination(&self) -> Result<Option<HboneAddress>, Error> {
+        if self.through_waypoint {
+            // When request is routed through a waypoint using HBONE, we preserve the original
+            // target as HBONE :authority.
+            //
+            // NOTE: there is one exception for this and that's when we send request to another
+            // network through an E/W gateway - in this case we always use target service hostname
+            // instead of an original VIP.
+            Ok(Some(HboneAddress::SocketAddr(self.original_target)))
+        } else {
+            // If request does not go through the waypoint and we use HBONE protocol it basically
+            // means that we are talking directly to another waypoint. When it is the case we can
+            // use the workload address directly as the HBONE target.
+            //
+            // And when protocol is TCP, then we don't use HBONE at all, so there is no HBONE
+            // :authority to begin with.
+            //
+            // NOTE: There is one exception to this - when we talk to E/W gateway. When that's the
+            // case we will see protocol TCP, but we still would need to use HBONE (actually double
+            // HBONE) protocol, but it's a special case that the caller need to handle.
+            match self.workload.protocol {
+                InboundProtocol::HBONE => self.selected_workload_ip.map(
+                    |ip| Some(HboneAddress::SocketAddr(SocketAddr::new(ip, self.port))))
+                    .ok_or(Error::NoValidDestination(Box::new((*self.workload).clone()))),
+                InboundProtocol::TCP => Ok(None),
+            }
+        }
     }
 }
 
@@ -164,6 +208,231 @@ impl fmt::Display for ProxyRbacContext {
         Ok(())
     }
 }
+
+#[derive(Clone)]
+struct Candidate {
+    workload: Arc<Workload>,
+    waypoint: Option<Arc<Service>>,
+    endpoint: Endpoint,
+    port: u16,
+}
+
+struct EndpointPicker<'a> {
+    source_workload: &'a Workload,
+    target_service: &'a Service,
+    candidates: HashMap<Strng, Candidate>,
+    clusters: HashMap<Strng, Vec<Candidate>>,
+    best_rank: usize,
+    has_waypoints: bool,
+    has_directs: bool,
+}
+
+impl<'a> EndpointPicker<'a> {
+    fn new(source_workload: &'a Workload, target_service: &'a Service) -> Self {
+        EndpointPicker {
+            source_workload,
+            target_service,
+            candidates: Default::default(),
+            clusters: Default::default(),
+            best_rank: 0,
+            has_waypoints: false,
+            has_directs: false,
+        }
+    }
+
+    /// Rank tells us how closly does the target workload match the routing preferences of the
+    /// service. The higher the rank the better the target workload fit the load balancing
+    /// preferences.
+    ///
+    /// If target workload does not match load balancing policy at all, None is returned.
+    fn workload_rank(&self, target: &Workload) -> Option<usize> {
+        // Say load balancing policy sets routing prefernces so we need to consider network,
+        // region and zone (e.g., routing preferences list is [Network, Region, Zone].
+        //
+        // We will go over the routing preferences list and compare network, region and zone
+        // of the source and target workloads in that order. When they match we will add +1
+        // to the rank, and when they don't match we stop.
+        //
+        // So in the example above, when all the criteria match we will get rank 3. If zone is
+        // different, but network and region are the same, we will get rank 2. If network matches
+        // but the region does not, then regardless of whether the zone matches, the rank will be
+        // 1.
+        match &self.target_service.load_balancer {
+            Some(lb) if lb.mode != LoadBalancerMode::Standard => {
+                let source = &self.source_workload;
+                let mut rank = 0;
+                for scope in &lb.routing_preferences {
+                    let matches = match scope {
+                        LoadBalancerScopes::Region => source.locality.region == target.locality.region,
+                        LoadBalancerScopes::Zone => source.locality.zone == target.locality.zone,
+                        LoadBalancerScopes::Subzone => source.locality.subzone == target.locality.subzone,
+                        LoadBalancerScopes::Node => source.node == target.node,
+                        LoadBalancerScopes::Cluster => source.cluster_id == target.cluster_id,
+                        LoadBalancerScopes::Network => source.network == target.network,
+                    };
+                    if matches {
+                        rank += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if lb.mode == LoadBalancerMode::Strict && rank != lb.routing_preferences.len() {
+                    return None;
+                }
+                Some(rank)
+            },
+            _ => Some(0),
+        }
+    }
+
+    fn add_waypoint_endpoint(&mut self, workload: Arc<Workload>, waypoint: Arc<Service>, endpoint: Endpoint, port: u16) {
+        let candidate = Candidate {
+            workload,
+            waypoint: Some(waypoint),
+            endpoint,
+            port,
+        };
+        self.add_candidate(candidate);
+    }
+
+    fn add_direct_endpoint(&mut self, workload: Arc<Workload>, endpoint: Endpoint, port: u16) {
+        let candidate = Candidate {
+            workload,
+            waypoint: None,
+            endpoint,
+            port,
+        };
+        self.add_candidate(candidate);
+    }
+
+    fn add_candidate(&mut self, candidate: Candidate) {
+        let rank = match self.workload_rank(&candidate.workload) {
+            Some(rank) => rank,
+            _ => return,
+        };
+
+        if rank < self.best_rank {
+            // If it's not as good as some other options we've seen already, then we can ignore it
+            return;
+        }
+
+        if rank > self.best_rank {
+            // If it's strictly better than anything we've seen so far, then we can drop all the
+            // endpoints we've considered up to this point and start from scratch.
+            self.candidates = Default::default();
+            self.clusters = Default::default();
+            self.best_rank = rank;
+            self.has_waypoints = false;
+            self.has_directs = false;
+        }
+
+        let uid = candidate.workload.uid.clone();
+        let cluster_id = candidate.workload.cluster_id.clone();
+
+        if self.candidates.insert(uid, candidate.clone()).is_none() {
+            if candidate.waypoint.is_some() {
+                self.has_waypoints = true;
+            } else {
+                self.has_directs = true;
+            }
+            self.clusters.entry(cluster_id).or_insert(Vec::new()).push(candidate);
+        }
+    }
+
+    fn pick_candidate(&self) -> Option<&Candidate> {
+        // We have multiple options how we can pick an endpoint out of many availble in
+        // multi-cluster scenario and none of those options is ideal:
+        //
+        // 1. We can pick random cluster from the list assuming equal weight and then pick an
+        //    endpoint in that cluster
+        // 2. We can pick among all endpoints proportionally to workload capacity.
+        //
+        // Why both of those options are not ideal?
+        //
+        // If we keep cluster randomly first, that assumes that all clusters have roughly the
+        // same capacity to handle requests, which may not necessarily be true.
+        //
+        // To address the problem above, we may pick a backend ignoring clusters according to
+        // the capacity of the endpoint. That would work in uniform setup, however, in non-unifrom
+        // setup we will be picking between actual service endpoints and waypoint endpoints which
+        // is like compraing apples and oranges.
+        //
+        // In the alpha version what we did is as follows:
+        //
+        // 1. We assumed that setup is uniform, e.g. the same service will either have or not have
+        //    a waypoint in all the clusters
+        // 2. For services with waypoint, we inherit PreferLocal load balancing policy, so traffic
+        //    will stay local unless there are no healthy waypoint endpoints in the local cluster,
+        //    in which case it will failover to a remote cluster
+        // 3. For services with no waypoint, if there is no traffic policy set on the service, we
+        //    will distribute the load between endpoints according to endpoint capacity.
+        //
+        // As far as multi-cluster setups are concerned, while alpha behavior makes sense it's
+        // somewhat inconsistent (i.e., services with waypoint keep traffic local, while
+        // services without waypoint do not).
+        //
+        // In this version, we opted into bringing some consistency when we have a choice between
+        // clusters:
+        //
+        // 1. We respect the load balancing policy (if load balancing policy prefers local, we will
+        //    try to stay local)
+        // 2. When load balancing policy does not set preference, we just distribute the load
+        //    between clusters and pick a backend within the cluster according to capacity.
+        //
+        // With this, both services with and without waypoint will distribute the load between
+        // clusters by default. If users want to change that, they could set PreferClose on the
+        // service to prefer local clusters and only failover when there are no healthy local
+        // endpoints. It's also somewhat closer to multi-cluster behavior in sidecar mode.
+        //
+        // Forward looking, a north star if you will, should be implementing latency based load
+        // balancing and outlier detection. e2e latency is a good unifying metric that would allow
+        // us to compare routes through waypoint, e/w gateways and directly service backends
+        // uniformly, while outlier detection would allow us to eject routes that result in failed
+        // requests.
+        //
+        // Additionally, when setup is completely uniform (e.g., either all endpoints are waypoints
+        // or none of them are) we use to capacity based load-balancing.
+
+        if self.candidates.is_empty() {
+            assert!(self.clusters.is_empty());
+            return None;
+        }
+        assert!(!self.clusters.is_empty());
+
+        // For the purposes of selecting our load balancing algorithm, we consider the setup
+        // uniform if it all the endpoints are waypoints or if none of them are waypoints. When
+        // it's the case, we can compare costs of the backends directly and avoid comparing apples
+        // to organges (where regular service backends are apples and waypoint backends are
+        // oranges). When setup is uniform we pick endpoint proportionally to the capacity (and it
+        // would either be a capacity of the target service backend or capacity of waypoint).
+        let setup_is_uniform = self.has_waypoints != self.has_directs;
+        if setup_is_uniform {
+            let options = self.candidates.iter().map(|(_, c)| { c }).collect::<Vec<_>>();
+
+            if options.is_empty() {
+                None
+            } else {
+                options.choose_weighted(&mut rand::rng(), |c| c.workload.capacity as u64).ok().map(|r| *r)
+            }
+        } else {
+            // When setup is not uniform, directly comparing capacity of workloads is a bit strange
+            // because we would comparing capacity of the actual service backends to capacity of a
+            // proxy in front of the actual service backends.
+            //
+            // Instead we use another dubious approximation - we assume all clusters are equal and
+            // randomly pick a cluster and then pick a backend in that cluster proportionally to
+            // capacity.
+            let clusters = self.clusters.iter().map(|(c, _)| { c }).collect::<Vec<_>>();
+            // We checked above that the list of candidates is not empty and each candidate belongs
+            // to a cluster, so the list of clusters must not be empty either.
+            let cluster = clusters.choose(&mut rand::rng()).unwrap();
+
+            self.clusters[*cluster].choose_weighted(
+                &mut rand::rng(), |c| { c.workload.capacity as u64 }).ok()
+        }
+    }
+}
+
 /// The current state information for this proxy.
 #[derive(Debug)]
 pub struct ProxyState {
@@ -346,13 +615,13 @@ impl ProxyState {
         Some((wl, target_port, Some(svc)))
     }
 
-    fn load_balance<'a>(
+    fn load_balance(
         &self,
         src: &Workload,
-        svc: &'a Service,
+        svc: &Service,
         svc_port: u16,
         resolution_mode: ServiceResolutionMode,
-    ) -> Option<(&'a Endpoint, Arc<Workload>)> {
+    ) -> Option<(Endpoint, Arc<Workload>)> {
         let target_port = svc.ports.get(&svc_port).copied();
 
         if resolution_mode == ServiceResolutionMode::Standard && target_port.is_none() {
@@ -361,10 +630,14 @@ impl ProxyState {
             return None;
         };
 
-        let endpoints = svc.endpoints.iter().filter_map(|ep| {
+        debug!("picking an end point for service: {:?}", svc);
+
+        let mut picker = EndpointPicker::new(src, svc);
+        for ep in svc.endpoints.iter() {
+            debug!("considering {}", ep.workload_uid);
             let Some(wl) = self.workloads.find_uid(&ep.workload_uid) else {
-                info!("failed to fetch workload for {}", ep.workload_uid);
-                return None;
+                debug!("failed to fetch workload for {}", ep.workload_uid);
+                continue;
             };
 
             let in_network = wl.network == src.network;
@@ -375,20 +648,19 @@ impl ProxyState {
                 // WDS is client-agnostic, so we will get a network gateway for a workload
                 // even if it's in the same network; we should never use it.
                 if in_network || !has_network_gateway {
-                    return None;
+                    continue;
                 }
             }
 
-            info!("considering endpoint {}", ep.workload_uid);
             match resolution_mode {
                 ServiceResolutionMode::Standard => {
                     if target_port.unwrap_or_default() == 0 && !ep.port.contains_key(&svc_port) {
                         // Filter workload out, it doesn't have a matching port
-                        info!(
+                        debug!(
                             "filter endpoint {}, it does not have service port {}",
                             ep.workload_uid, svc_port
                         );
-                        return None;
+                        continue;
                     }
                 }
                 ServiceResolutionMode::Waypoint => {
@@ -397,73 +669,25 @@ impl ProxyState {
                         // This is only valid for waypoints, which are not explicitly addressed by users.
                         // We do happen to do a lookup by `waypoint-svc:15008`, this is not a literal call on that service;
                         // the port is not required at all if they have application tunnel, as it will be handled by ztunnel on the other end.
-                        info!(
+                        debug!(
                             "filter waypoint endpoint {}, target port is not defined",
                             ep.workload_uid
                         );
-                        return None;
+                        continue;
                     }
                 }
             }
-            Some((ep, wl))
-        });
 
-        let options = match svc.load_balancer {
-            Some(ref lb) if lb.mode != LoadBalancerMode::Standard => {
-                let ranks = endpoints
-                    .filter_map(|(ep, wl)| {
-                        // Load balancer will define N targets we want to match
-                        // Consider [network, region, zone]
-                        // Rank = 3 means we match all of them
-                        // Rank = 2 means network and region match
-                        // Rank = 0 means none match
-                        let mut rank = 0;
-                        for target in &lb.routing_preferences {
-                            let matches = match target {
-                                LoadBalancerScopes::Region => {
-                                    src.locality.region == wl.locality.region
-                                }
-                                LoadBalancerScopes::Zone => src.locality.zone == wl.locality.zone,
-                                LoadBalancerScopes::Subzone => {
-                                    src.locality.subzone == wl.locality.subzone
-                                }
-                                LoadBalancerScopes::Node => src.node == wl.node,
-                                LoadBalancerScopes::Cluster => src.cluster_id == wl.cluster_id,
-                                LoadBalancerScopes::Network => src.network == wl.network,
-                            };
-                            if matches {
-                                rank += 1;
-                            } else {
-                                break;
-                            }
-                        }
-                        // Doesn't match all, and required to. Do not select this endpoint
-                        if lb.mode == LoadBalancerMode::Strict
-                            && rank != lb.routing_preferences.len()
-                        {
-                            info!("drop endpoint {} from consideration because it does not match load balancing policy", ep.workload_uid);
-                            return None;
-                        }
-                        info!("consider endpoint {} with weight {}", ep.workload_uid, wl.capacity);
-                        Some((rank, ep, wl))
-                    })
-                    .collect::<Vec<_>>();
-                let max = *ranks.iter().map(|(rank, _ep, _wl)| rank).max()?;
-                let options: Vec<_> = ranks
-                    .into_iter()
-                    .filter(|(rank, _ep, _wl)| *rank == max)
-                    .map(|(_, ep, wl)| (ep, wl))
-                    .collect();
-                options
-            }
-            _ => endpoints.collect(),
-        };
-        options
-            .choose_weighted(&mut rand::rng(), |(_, wl)| wl.capacity as u64)
-            // This can fail if there are no weights, the sum is zero (not possible in our API), or if it overflows
-            // The API has u32 but we sum into an u64, so it would take ~4 billion entries of max weight to overflow
-            .ok()
-            .cloned()
+            picker.add_direct_endpoint(wl, ep.clone(), /*calling code figures out the right port*/0);
+        }
+
+        if let Some(candidate) = picker.pick_candidate() {
+            debug!("identified a candiate");
+            Some((candidate.endpoint.clone(), candidate.workload.clone()))
+        } else {
+            debug!("failed to find a viable candidate");
+            None
+        }
     }
 }
 
@@ -483,6 +707,9 @@ pub struct DemandProxyState {
 
     #[serde(skip_serializing)]
     dns_resolver: TokioResolver,
+
+    #[serde(skip_serializing)]
+    hbone_port: u16,
 }
 
 impl DemandProxyState {
@@ -502,6 +729,7 @@ impl DemandProxyState {
         dns_resolver_cfg: ResolverConfig,
         dns_resolver_opts: ResolverOpts,
         metrics: Arc<proxy::Metrics>,
+        hbone_port: u16,
     ) -> Self {
         let mut rb = hickory_resolver::Resolver::builder_with_config(
             dns_resolver_cfg,
@@ -514,7 +742,13 @@ impl DemandProxyState {
             demand,
             dns_resolver,
             metrics,
+            hbone_port,
         }
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    pub fn set_hbone_port(&mut self, hbone_port: u16) {
+        self.hbone_port = hbone_port;
     }
 
     pub fn read(&self) -> RwLockReadGuard<'_, ProxyState> {
@@ -784,15 +1018,17 @@ impl DemandProxyState {
             // Drop the lock
         };
         tracing::trace!(%addr, ?upstream, "fetch_upstream");
-        self.finalize_upstream(source_workload, addr, upstream)
+        self.finalize_upstream(source_workload, addr, upstream, addr, false)
             .await
     }
 
     async fn finalize_upstream(
         &self,
         source_workload: &Workload,
-        original_target_address: SocketAddr,
+        target_address: SocketAddr,
         upstream: Option<(Arc<Workload>, u16, Option<Arc<Service>>)>,
+        original_target: SocketAddr,
+        through_waypoint: bool,
     ) -> Result<Option<Upstream>, Error> {
         let Some((wl, port, svc)) = upstream else {
             return Ok(None);
@@ -803,7 +1039,7 @@ impl DemandProxyState {
             .pick_workload_destination_or_resolve(
                 &wl,
                 source_workload,
-                original_target_address,
+                target_address,
                 ip_family_restriction,
             )
             .await?; // if we can't load balance just return the error
@@ -813,6 +1049,9 @@ impl DemandProxyState {
             port,
             service_sans: svc.map(|s| s.subject_alt_names.clone()).unwrap_or_default(),
             destination_service: svc_desc,
+            original_target,
+            through_waypoint,
+            hbone_port: self.hbone_port,
         };
         tracing::trace!(?res, "finalize_upstream");
         Ok(Some(res))
@@ -870,7 +1109,7 @@ impl DemandProxyState {
                 }
             }
         };
-        self.finalize_upstream(source_workload, target_address, res)
+        self.finalize_upstream(source_workload, target_address, res, original_destination_address, false)
             .await?
             .ok_or_else(|| {
                 Error::UnknownNetworkGateway(format!("network gateway {gw_address:?} not found"))
@@ -901,6 +1140,7 @@ impl DemandProxyState {
                 (us, addr)
             }
             Destination::Hostname(host) => {
+                debug!("waypoint is {}", host);
                 let state = self.read();
                 match state.find_hostname(host) {
                     Some(Address::Service(s)) => {
@@ -927,7 +1167,7 @@ impl DemandProxyState {
                 }
             }
         };
-        self.finalize_upstream(source_workload, target_address, res)
+        self.finalize_upstream(source_workload, target_address, res, original_destination_address, true)
             .await?
             .ok_or_else(|| Error::UnknownWaypoint(format!("waypoint {gw_address:?} not found")))
     }
@@ -960,6 +1200,206 @@ impl DemandProxyState {
         self.fetch_waypoint(gw_address, source_workload, original_destination_address)
             .await
             .map(Some)
+    }
+
+    fn translate_service_port(&self, endpoint: &Endpoint, workload: &Workload, service: &Service, service_port: u16) -> Option<u16> {
+        let service_target_port = service.ports.get(&service_port).copied().unwrap_or_default();
+        if let Some(&ep_target_port) = endpoint.port.get(&service_port) {
+            // When endpoint has the port we prefer it
+            Some(ep_target_port)
+        } else if service_target_port > 0 {
+            // otherwise use the port from the service itself
+            Some(service_target_port)
+        } else if let Some(ApplicationTunnel { port: Some(_), .. }) = workload.application_tunnel {
+            // when using app tunnel, we don't require the port to be found on the service at all
+            Some(service_port)
+        } else {
+            None
+        }
+    }
+
+    /// Fetch upstream for the service in a multicluster-aware way.
+    /// We want to support non-uniform waypoint configuration in multicluster scenario,
+    /// so that each clsuter can decide on their own whether and how to configure waypoints.
+    /// This may result in configurations where the same service uses different waypoint
+    /// services in different clusters or uses a waypoint in one cluster but no waypoint in some
+    /// other cluster.
+    pub async fn fetch_service_upstream(
+        &self,
+        service: Arc<Service>,
+        source: &Workload,
+        original_target_address: SocketAddr,
+    ) -> Result<Option<Upstream>, Error> {
+        // The basic idea is we go over all clusters and for each cluster check if it has a
+        // waypoint configured. If it has a waypoint configure we add endpoints of the waypoint
+        // service to the list of candidate endpoints. If the cluster does not have a waypoint
+        // configured then we add endpoints of the target service in that cluster instead. We load
+        // balance over the combined list of endpoints.
+        //
+        // NOTE: implementing things exactly as described above (e.g., going over the list of
+        // clusters and checking each endpoint in that cluster) might not scale that well in a
+        // uniform or partially uniform setup as we would check the same service and it's endpoints
+        // multiple times doing unnecessary work. So instead this implementation is structured so
+        // that each endpoint of each service that we consider is only checked once.
+        //
+        // TODO: Think through the locking scheme here, in general we probably don't want to hold a
+        // lock on state while doing an async operation. On top of that fetch_destination that we
+        // use to get waypoint services is an async operation that can't complete until we release
+        // the locks (even if we only hold a read lock). That's why we only temporaroly grab locks
+        // to resolve workload uids and inside the fetch_destination. That being said, maybe we
+        // don't need to grab and release the lock for each endpoint?
+        let service_port = original_target_address.port();
+        let mut picker = EndpointPicker::new(source, &service);
+
+        // We first check target service endpoints and ignore those that are in clusters with
+        // waypoint configured. Once we go over all the endpoints of the service we will not return
+        // to it anymore, thus checking service endpoints only once.
+        let target_port = service.ports.get(&service_port).copied();
+
+        if target_port.is_some() {
+            for ep in service.endpoints.iter() {
+                let Some(wl) = self.read().workloads.find_uid(&ep.workload_uid) else {
+                    info!("failed to fetch workload for {}", ep.workload_uid);
+                    continue;
+                };
+
+                let in_network = wl.network == source.network;
+                let has_network_gateway = wl.network_gateway.is_some();
+                let has_address = !wl.workload_ips.is_empty() || !wl.hostname.is_empty();
+                if !has_address {
+                    // Workload has no IP. We can only reach it via a network gateway.
+                    // WDS is client-agnostic, so we will get a network gateway for a workload
+                    // even if it's in the same network; we should never use it.
+                    if in_network || !has_network_gateway {
+                        info!(
+                            "skipping endpoint {} because it does not have an address", ep.workload_uid);
+                        continue;
+                    }
+                }
+
+                if service.waypoints.inner.get(&wl.cluster_id).is_some() {
+                    info!("skipping endpoint {} because it's in a cluster with waypoint configured", ep.workload_uid);
+                    continue;
+                }
+
+                if target_port.unwrap_or_default() == 0 && !ep.port.contains_key(&service_port) {
+                    info!("skipping endpoint {}, it does not have service port {}", ep.workload_uid, service_port);
+                    continue;
+                }
+
+                if let Some(port) = self.translate_service_port(ep, &wl, &service, service_port) {
+                    picker.add_direct_endpoint(wl, ep.clone(), port);
+                } else {
+                    // This will never happen, because we checked above that either service has the
+                    // port or endpoint has one.
+                    info!("skipping endpoint {}, because port {} is unknown", ep.workload_uid, service_port);
+                }
+            }
+        } else {
+            // In single-cluster scenario we would give up here and return None, but in
+            // multi-cluster scenario we might still have other clusters that we could consider
+            // where we have waypoints and therefore use a slightly different criteria. Log a debug
+            // message here and continue to check other clusters.
+            info!("service {} does not have port {}", service.hostname, service_port);
+        }
+
+        // After we checked the service endpoints, we can check all the waypoints. To avoid
+        // checking the same waypoint service multiple times we keep track of what waypoints we
+        // already checked.
+        //
+        // To remove the need to check the same waypoint again, once we started checking a
+        // waypoint service we keep checking all endpoints of the waypoint service for all
+        // clusters. We just need to ignore clusters where there is no waypoint or a different
+        // waypoint is configured.
+        let mut visited = HashSet::new();
+        for (_, gw) in service.waypoints.inner.iter() {
+            if !visited.insert(gw.clone()) {
+                // We already considered this waypoint, so skipping it and moving to the next one.
+                continue;
+            }
+
+            match self.fetch_destination(&gw.destination).await {
+                Some(Address::Workload(_)) => {
+                    // It does not seem hard to add support for non-service waypoints, but for PoC
+                    // I'm going to ignore this case as it's non a very typical setup of Istio.
+                    info!("non-service waypoints are not supported yet");
+                }
+                Some(Address::Service(waypoint)) => {
+                    // Given that it's not a service endpoint, but a waypoint endpoint, we use
+                    // HBONE port instead.
+                    let service_target_port = waypoint.ports.get(&gw.hbone_mtls_port).copied();
+
+                    for ep in waypoint.endpoints.iter() {
+                        let Some(wl) = self.read().workloads.find_uid(&ep.workload_uid) else {
+                            info!("failed to fetch workload for {}", ep.workload_uid);
+                            continue;
+                        };
+
+                        let in_network = wl.network == source.network;
+                        let has_network_gateway = wl.network_gateway.is_some();
+                        let has_address = !wl.workload_ips.is_empty() || !wl.hostname.is_empty();
+                        if !has_address {
+                            // Workload has no IP. We can only reach it via a network gateway.
+                            // WDS is client-agnostic, so we will get a network gateway for a workload
+                            // even if it's in the same network; we should never use it.
+                            if in_network || !has_network_gateway {
+                                info!(
+                                    "skipping endpoint {} because it does not have an address",
+                                    ep.workload_uid);
+                                continue;
+                            }
+                        }
+
+                        if service_target_port.is_none() && wl.application_tunnel.is_none() {
+                            info!("filter waypoint endpoint {}, target port is not defined", ep.workload_uid);
+                            continue;
+                        }
+
+                        // If in the cluster of this workload we don't have a waypoint or have a
+                        // different waypoint, then we should skip this workload as it's not the
+                        // right candidate.
+                        if service.waypoints.inner.get(&wl.cluster_id) != Some(gw) {
+                            info!("skipping endpoint {} because it does not belong to the right waypoint for cluster {}",
+                                ep.workload_uid, wl.cluster_id);
+                            continue;
+                        }
+
+                        if let Some(port) = self.translate_service_port(ep, &wl, &waypoint, gw.hbone_mtls_port) {
+                            picker.add_waypoint_endpoint(wl, waypoint.clone(), ep.clone(), port);
+                        } else {
+                            // This can never happen because we checked before that either service
+                            // has a port or the workload has app tunnel and therefore we don't
+                            // need a port.
+                            info!("skipping endpoint {}, because port {} is unknown", ep.workload_uid, gw.hbone_mtls_port);
+                        }
+                    }
+                }
+                None => info!("waypoint {:?} not found", gw.destination),
+            };
+        }
+
+        if let Some(candidate) = picker.pick_candidate() {
+            self.finalize_upstream(
+                &source,
+                // This address is essentially only used to figure out whether the original request
+                // was using IPv6 or IPv4. We want to try and preserve original IP family of the
+                // request.
+                //
+                // When we route request through a waypoint, what we should properly do is to check
+                // whether waypoint is IP-addressed or not and if it's we should use that IP
+                // address here instead.
+                //
+                // I'm cutting a corner here somewhat and ignore that logic, but it should be good
+                // enough for PoC, because by default we don't use IP addressed waypoints.
+                original_target_address,
+                Some((candidate.workload.clone(), candidate.port, candidate.waypoint.clone().or(Some(service.clone())))),
+                original_target_address,
+                candidate.waypoint.is_some(),
+            ).await
+        } else {
+            info!("service {} has no healthy endpoints in any of the clusters", service.hostname);
+            Ok(None)
+        }
     }
 
     /// Looks for either a workload or service by the destination. If not found locally,
@@ -1083,6 +1523,7 @@ impl ProxyStateManager {
                 config.dns_resolver_cfg.clone(),
                 config.dns_resolver_opts.clone(),
                 proxy_metrics,
+                config.inbound_addr.port(),
             ),
         })
     }
@@ -1129,6 +1570,7 @@ mod tests {
             ResolverConfig::default(),
             ResolverOpts::default(),
             metrics,
+            15008,
         );
 
         let want = WorkloadInfo {
@@ -1157,6 +1599,7 @@ mod tests {
             ResolverConfig::default(),
             ResolverOpts::default(),
             metrics,
+            15008,
         );
 
         let want = WorkloadInfo {
@@ -1195,6 +1638,7 @@ mod tests {
             ResolverConfig::default(),
             ResolverOpts::default(),
             metrics,
+            15008,
         );
 
         // Some from Address
@@ -1237,6 +1681,7 @@ mod tests {
             ResolverConfig::default(),
             ResolverOpts::default(),
             metrics,
+            15008,
         );
 
         // Some from Address
@@ -1428,6 +1873,7 @@ mod tests {
             ResolverConfig::default(),
             ResolverOpts::default(),
             metrics,
+            15008,
         )
     }
 
@@ -1706,8 +2152,8 @@ mod tests {
                 for _ in 0..tries {
                     let got = state
                         .load_balance(src, svc, 80, ServiceResolutionMode::Standard)
-                        .map(|(ep, _)| ep.workload_uid.as_str());
-                    assert!(got != Some(uid), "{}", desc);
+                        .map(|(ep, _)| ep.workload_uid);
+                    assert!(got != Some(strng::new(uid)), "{}", desc);
                 }
             };
 

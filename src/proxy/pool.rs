@@ -1017,6 +1017,7 @@ mod test {
             ResolverConfig::default(),
             ResolverOpts::default(),
             metrics,
+            15008,
         );
         let local_workload = Arc::new(proxy::LocalWorkloadInformation::new(
             Arc::new(WorkloadInfo {

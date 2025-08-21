@@ -179,6 +179,7 @@ fn build_load_balancer(
         ResolverConfig::default(),
         ResolverOpts::default(),
         metrics,
+        15008,
     );
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

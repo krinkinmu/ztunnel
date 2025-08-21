@@ -471,6 +471,7 @@ pub fn new_proxy_state(
         ResolverConfig::default(),
         ResolverOpts::default(),
         metrics,
+        15008,
     )
 }
 
