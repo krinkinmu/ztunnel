@@ -288,7 +288,7 @@ ip -n {node_net} route add 172.172.0.0/17 dev eth0 scope link src 172.172.0.{nod
                     continue;
                 }
                 let other_id = s.id;
-                let other_net = format!("{}~{node}", &self.prefix);
+                let other_net = format!("{}~{node}", self.prefix);
                 helpers::run_command(&format!(
                     "
 set -ex
