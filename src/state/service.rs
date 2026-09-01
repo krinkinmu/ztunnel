@@ -810,7 +810,7 @@ impl ServiceStore {
     #[cfg(test)]
     pub fn num_services(&self) -> usize {
         let mut count = 0;
-        for (_, value) in self.by_host.iter() {
+        for value in self.by_host.values() {
             count += value.len();
         }
         count
