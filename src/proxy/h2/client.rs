@@ -60,7 +60,7 @@ pub struct WorkloadKey {
 
 impl Display for WorkloadKey {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}({})->{}[", self.src, &self.src_id, self.dst,)?;
+        write!(f, "{}({})->{}[", self.src, self.src_id, self.dst,)?;
         for i in &self.dst_id {
             write!(f, "{i}")?;
         }
